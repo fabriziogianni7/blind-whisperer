@@ -1,0 +1,127 @@
+import base64
+import logging
+from typing import Annotated
+
+import httpx
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from openai import OpenAI
+from pydantic import BaseModel
+
+from app.config import Settings, settings
+
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Blind Whisperer API", version="0.1.0")
+
+_origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_origins or ["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def get_settings() -> Settings:
+    return settings
+
+
+class SceneResponse(BaseModel):
+    description: str
+    audio_mime: str = "audio/mpeg"
+    audio_base64: str
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/api/scene", response_model=SceneResponse)
+async def describe_scene(
+    image: Annotated[UploadFile, File(description="Camera frame as JPEG or PNG")],
+    s: Annotated[Settings, Depends(get_settings)],
+):
+    if not s.openai_api_key:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured")
+    if not s.elevenlabs_api_key or not s.elevenlabs_voice_id:
+        raise HTTPException(
+            status_code=500,
+            detail="ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID must be configured",
+        )
+
+    raw = await image.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty image upload")
+
+    mime = image.content_type or "image/jpeg"
+    if not mime.startswith("image/"):
+        mime = "image/jpeg"
+
+    b64 = base64.b64encode(raw).decode("ascii")
+    data_url = f"data:{mime};base64,{b64}"
+
+    client = OpenAI(api_key=s.openai_api_key)
+    try:
+        completion = client.chat.completions.create(
+            model=s.openai_model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You help blind users understand their surroundings. "
+                        "Describe the image briefly and clearly for spoken audio: "
+                        "no markdown, no bullet lists, one or two short sentences unless "
+                        "the scene is complex. Mention important hazards, people, text, and objects."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "What do you see? Respond as plain speech.",
+                        },
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                },
+            ],
+            max_tokens=300,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("OpenAI vision failed")
+        raise HTTPException(status_code=502, detail=f"OpenAI error: {exc}") from exc
+
+    description = (completion.choices[0].message.content or "").strip()
+    if not description:
+        raise HTTPException(status_code=502, detail="Empty description from model")
+
+    tts_url = f"https://api.elevenlabs.io/v1/text-to-speech/{s.elevenlabs_voice_id}"
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as http:
+            tts_resp = await http.post(
+                tts_url,
+                headers={
+                    "xi-api-key": s.elevenlabs_api_key,
+                    "Accept": "audio/mpeg",
+                },
+                json={
+                    "text": description,
+                    "model_id": s.elevenlabs_model_id,
+                },
+            )
+    except httpx.HTTPError as exc:
+        logger.exception("ElevenLabs request failed")
+        raise HTTPException(status_code=502, detail=f"ElevenLabs network error: {exc}") from exc
+
+    if tts_resp.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"ElevenLabs error {tts_resp.status_code}: {tts_resp.text[:500]}",
+        )
+
+    audio_bytes = tts_resp.content
+    audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+    return SceneResponse(description=description, audio_mime="audio/mpeg", audio_base64=audio_b64)
