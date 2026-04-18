@@ -74,6 +74,10 @@ Ensure the **backend** is reachable from the phone (same Wi‑Fi, firewall allow
 
 To use the **glasses camera, microphones, or speakers** instead of only the phone, add Meta’s toolkit to the **native** project and bridge frames or audio to your backend—the FastAPI contract (`POST /api/scene`) stays the same. Follow [Setup](https://wearables.developer.meta.com/docs/getting-started-toolkit) and [Build an integration](https://wearables.developer.meta.com/docs/build-overview) in the Wearables Developer Center; you will need Meta AI app developer mode and compatible glasses firmware.
 
+### Simulation (browser, emulator, Mock Device Kit)
+
+You can run and test without physical glasses in several ways: local web dev, Android/iOS simulators with the Capacitor shell, and Meta’s **Mock Device Kit** after you integrate their native SDK. See **[docs/meta-glasses-simulation.md](docs/meta-glasses-simulation.md)** for step-by-step instructions.
+
 ## API
 
 `POST /api/scene` — multipart field `image` (JPEG/PNG). Response JSON:
