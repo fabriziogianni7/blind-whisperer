@@ -57,6 +57,17 @@ header h1 {
   font-size: 1.05rem;
 }
 
+.lead .nowrap {
+  white-space: nowrap;
+}
+
+.help-text {
+  margin: 0.75rem 0 0;
+  color: var(--muted);
+  font-size: 0.95rem;
+  line-height: 1.45;
+}
+
 .panel {
   background: var(--surface);
   border-radius: 1rem;
