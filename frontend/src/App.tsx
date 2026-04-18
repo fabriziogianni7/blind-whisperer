@@ -9,11 +9,41 @@ const WAKE_PHRASE = "hey blindr";
 /** Avoids duplicate onboarding speech when React Strict Mode mounts twice in development. */
 let onboardingPlaybackSessionStarted = false;
 
+const MAX_HISTORY = 12; // 6 user + 6 assistant turns
+const GRACE_MS = 3000; // suppress auto-capture for this long after a barge-in
+
 type ScenePayload = {
   description: string;
   audio_mime: string;
   audio_base64: string;
+  speak: boolean;
 };
+
+type Turn = { role: "user" | "assistant"; text: string };
+
+type SpeechRecognitionLike = {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  maxAlternatives?: number;
+  onresult: ((ev: { resultIndex?: number; results: ArrayLike<ArrayLike<{ transcript: string; confidence: number }> & { isFinal: boolean }> }) => void) | null;
+  onspeechstart: (() => void) | null;
+  onerror: ((ev: { error: string }) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+  abort: () => void;
+};
+
+type SpeechRecognitionCtor = new () => SpeechRecognitionLike;
+
+function getSpeechRecognitionCtor(): SpeechRecognitionCtor | null {
+  const w = window as unknown as {
+    SpeechRecognition?: SpeechRecognitionCtor;
+    webkitSpeechRecognition?: SpeechRecognitionCtor;
+  };
+  return w.SpeechRecognition || w.webkitSpeechRecognition || null;
+}
 
 function normalizeSpeechText(raw: string): string {
   return raw
@@ -27,7 +57,6 @@ function transcriptHasWakePhrase(normalized: string): boolean {
   return normalized.includes(WAKE_PHRASE);
 }
 
-/** Text after the last wake phrase, for command parsing */
 function textAfterWakePhrase(normalized: string): string {
   const idx = normalized.lastIndexOf(WAKE_PHRASE);
   if (idx === -1) return "";
@@ -44,28 +73,25 @@ function parseVoiceIntent(normalizedFull: string): "start" | "stop" | null {
   return null;
 }
 
-function getSpeechRecognition(): (new () => SpeechRecognition) | null {
-  if (typeof window === "undefined") return null;
-  return window.SpeechRecognition ?? window.webkitSpeechRecognition ?? null;
-}
-
 export function App() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const stopRef = useRef<HTMLButtonElement>(null);
-  const recognitionRef = useRef<SpeechRecognition | null>(null);
+  const wakeRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const bargeRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
 
   const statusId = useId();
   const liveId = useId();
   const voiceStatusId = useId();
 
   const [whispering, setWhispering] = useState(false);
-  const [intervalSec, setIntervalSec] = useState(4);
+  const [intervalSec, setIntervalSec] = useState(5);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [apiError, setApiError] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState("Camera idle.");
   const [lastDescription, setLastDescription] = useState("");
+  const [lastHeard, setLastHeard] = useState("");
   const [voiceStatus, setVoiceStatus] = useState<string>("Checking voice support.");
   const [onboardingDone, setOnboardingDone] = useState(
     () => typeof localStorage !== "undefined" && localStorage.getItem(ONBOARDING_STORAGE_KEY) === "1",
@@ -73,8 +99,10 @@ export function App() {
 
   const whisperingRef = useRef(false);
   const inFlightRef = useRef(false);
-  const sceneAudioPlayingRef = useRef(false);
-  const voiceListenEnabledRef = useRef(false);
+  const historyRef = useRef<Turn[]>([]);
+  const pendingQueryRef = useRef<string | null>(null);
+  const graceUntilRef = useRef(0);
+  const wakeListenEnabledRef = useRef(false);
 
   useEffect(() => {
     whisperingRef.current = whispering;
@@ -110,7 +138,8 @@ export function App() {
       "Welcome to Blind Whisperer.",
       "This app uses your camera to capture snapshots, sends them to your server for vision understanding, then speaks a short description through Eleven Labs.",
       "Grant camera access when asked so the app can see the scene. For voice commands, your browser may ask for microphone access for speech recognition.",
-      "To start hands-free, say: hey blindr, then start watching.",
+      "While watching, you can speak any time to interrupt and ask a question about the scene.",
+      "To start hands-free before watching, say: hey blindr, then start watching.",
       "To stop, say: hey blindr, stop.",
       "Privacy note: camera frames are sent to your server and may be processed by third party services. Use a secure connection in production.",
     ].join(" ");
@@ -139,25 +168,21 @@ export function App() {
     playOnboarding();
   }, [onboardingDone, playOnboarding]);
 
-  const restartRecognitionIfNeeded = useCallback(() => {
-    const Rec = getSpeechRecognition();
-    const rec = recognitionRef.current;
-    if (!Rec || !rec || !voiceListenEnabledRef.current || sceneAudioPlayingRef.current) return;
+  const stopPlayback = useCallback(() => {
+    const el = audioRef.current;
+    if (!el) return;
+    el.pause();
     try {
-      rec.start();
+      el.currentTime = 0;
     } catch {
-      /* already started */
+      /* some browsers throw on empty src */
     }
   }, []);
 
-  const stopRecognitionSafe = useCallback(() => {
-    const rec = recognitionRef.current;
-    if (!rec) return;
-    try {
-      rec.stop();
-    } catch {
-      /* noop */
-    }
+  const pushTurn = useCallback((role: Turn["role"], text: string) => {
+    const next = [...historyRef.current, { role, text }];
+    if (next.length > MAX_HISTORY) next.splice(0, next.length - MAX_HISTORY);
+    historyRef.current = next;
   }, []);
 
   const playBase64Audio = useCallback(
@@ -165,26 +190,20 @@ export function App() {
       const el = audioRef.current;
       if (!el) return;
       el.pause();
-      sceneAudioPlayingRef.current = true;
-      stopRecognitionSafe();
-      speakUi("Playing scene description.");
-
-      const url = `data:${mime};base64,${b64}`;
-      el.src = url;
-
-      await new Promise<void>((resolve, reject) => {
-        el.onended = () => resolve();
-        el.onerror = () => reject(new Error("Audio playback failed"));
-        el.play().catch(reject);
-      }).catch(() => {
+      el.src = `data:${mime};base64,${b64}`;
+      if (whisperingRef.current) {
+        speakUi("Playing scene description.");
+      }
+      try {
+        await el.play();
+      } catch {
         setApiError("Audio was blocked by the browser. Tap the page once and try again.");
-      });
-
-      sceneAudioPlayingRef.current = false;
-      speakUi("Listening for: hey blindr, then start or stop.");
-      restartRecognitionIfNeeded();
+      }
+      if (whisperingRef.current) {
+        speakUi("Session active. Speak to ask a question, or say hey blindr, then stop.");
+      }
     },
-    [restartRecognitionIfNeeded, speakUi, stopRecognitionSafe],
+    [speakUi],
   );
 
   const captureFrameBlob = useCallback(async (): Promise<Blob | null> => {
@@ -204,42 +223,113 @@ export function App() {
     });
   }, []);
 
-  const sendFrame = useCallback(async () => {
-    if (!whisperingRef.current || inFlightRef.current) return;
-    const blob = await captureFrameBlob();
-    if (!blob) {
-      setStatusMessage("Waiting for camera frames.");
-      return;
-    }
-    inFlightRef.current = true;
-    setStatusMessage("Sending snapshot and generating speech.");
-    setApiError(null);
-    const form = new FormData();
-    form.append("image", blob, "frame.jpg");
-    try {
-      const res = await fetch(`${apiBase}/api/scene`, {
-        method: "POST",
-        body: form,
-      });
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(text || `Request failed (${res.status})`);
-      }
-      const data = (await res.json()) as ScenePayload;
-      if (!whisperingRef.current) return;
-      setLastDescription(data.description);
-      setStatusMessage("Playing whisper.");
-      await playBase64Audio(data.audio_mime || "audio/mpeg", data.audio_base64);
-      setStatusMessage("Next snapshot on interval.");
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : "Unknown error";
-      setApiError(msg);
-      setStatusMessage("Error while describing scene.");
-    } finally {
-      inFlightRef.current = false;
-    }
-  }, [captureFrameBlob, playBase64Audio]);
+  const sendFrame = useCallback(
+    async (opts?: { force?: boolean }) => {
+      if (!whisperingRef.current || inFlightRef.current) return;
+      if (!opts?.force && Date.now() < graceUntilRef.current) return;
 
+      const blob = await captureFrameBlob();
+      if (!blob) {
+        setStatusMessage("Waiting for camera frames.");
+        return;
+      }
+
+      const query = pendingQueryRef.current;
+      pendingQueryRef.current = null;
+
+      inFlightRef.current = true;
+      setStatusMessage(query ? `Asking: "${query}"` : "Describing scene.");
+      setApiError(null);
+
+      const form = new FormData();
+      form.append("image", blob, "frame.jpg");
+      form.append("history", JSON.stringify(historyRef.current));
+      if (query) form.append("user_query", query);
+
+      try {
+        const res = await fetch(`${apiBase}/api/scene`, { method: "POST", body: form });
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(text || `Request failed (${res.status})`);
+        }
+        const data = (await res.json()) as ScenePayload;
+
+        if (query) pushTurn("user", query);
+
+        if (data.speak && data.description) {
+          pushTurn("assistant", data.description);
+          setLastDescription(data.description);
+          setStatusMessage("Playing whisper.");
+          await playBase64Audio(data.audio_mime || "audio/mpeg", data.audio_base64);
+          setStatusMessage("Waiting for next tick.");
+        } else {
+          setStatusMessage("Scene unchanged.");
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Unknown error";
+        setApiError(msg);
+        setStatusMessage("Error while describing scene.");
+      } finally {
+        inFlightRef.current = false;
+      }
+    },
+    [captureFrameBlob, playBase64Audio, pushTurn],
+  );
+
+  const stopWakeRecognitionSafe = useCallback(() => {
+    const rec = wakeRecognitionRef.current;
+    if (!rec) return;
+    try {
+      rec.stop();
+    } catch {
+      /* noop */
+    }
+  }, []);
+
+  const startWhisper = useCallback(() => {
+    setWhispering(true);
+  }, []);
+
+  const stopWhisper = useCallback(() => {
+    setWhispering(false);
+    stopPlayback();
+    const el = audioRef.current;
+    if (el) {
+      try {
+        el.removeAttribute("src");
+      } catch {
+        /* noop */
+      }
+    }
+    setStatusMessage("Whispering stopped.");
+    speakUi("Listening for: hey blindr, then start or stop.");
+  }, [speakUi, stopPlayback]);
+
+  const handleVoiceTranscript = useCallback(
+    (raw: string) => {
+      const normalized = normalizeSpeechText(raw);
+      const intent = parseVoiceIntent(normalized);
+      if (intent === "start") {
+        setApiError(null);
+        speakUi("Starting watch.");
+        startWhisper();
+        return;
+      }
+      if (intent === "stop") {
+        speakUi("Stopping watch.");
+        stopWhisper();
+        return;
+      }
+      if (transcriptHasWakePhrase(normalized) && !intent) {
+        speakError(
+          "I did not understand. Say hey blindr, then start watching, or hey blindr, stop.",
+        );
+      }
+    },
+    [speakError, speakUi, startWhisper, stopWhisper],
+  );
+
+  // Camera + auto-capture loop
   useEffect(() => {
     if (!whispering) return;
 
@@ -249,6 +339,10 @@ export function App() {
     const start = async () => {
       setCameraError(null);
       setApiError(null);
+      historyRef.current = [];
+      pendingQueryRef.current = null;
+      graceUntilRef.current = 0;
+
       try {
         stream = await navigator.mediaDevices.getUserMedia({
           video: { facingMode: "environment" },
@@ -277,102 +371,72 @@ export function App() {
     return () => {
       if (timer) window.clearInterval(timer);
       const video = videoRef.current;
-      if (video) {
-        video.srcObject = null;
-      }
+      if (video) video.srcObject = null;
       stream?.getTracks().forEach((t) => t.stop());
     };
   }, [whispering, intervalSec, sendFrame]);
 
-  const startWhisper = useCallback(() => {
-    setWhispering(true);
-  }, []);
-
-  const stopWhisper = useCallback(() => {
-    setWhispering(false);
-    setStatusMessage("Whispering stopped.");
-    const el = audioRef.current;
-    if (el) {
-      el.pause();
-      el.removeAttribute("src");
-    }
-    sceneAudioPlayingRef.current = false;
-    restartRecognitionIfNeeded();
-  }, [restartRecognitionIfNeeded]);
-
+  // Wake phrase + start/stop when not in a watch session
   useEffect(() => {
-    if (whispering) {
-      stopRef.current?.focus();
+    if (!onboardingDone || whispering) {
+      wakeListenEnabledRef.current = false;
+      const rec = wakeRecognitionRef.current;
+      wakeRecognitionRef.current = null;
+      if (rec) {
+        try {
+          rec.abort();
+        } catch {
+          try {
+            rec.stop();
+          } catch {
+            /* noop */
+          }
+        }
+      }
+      return;
     }
-  }, [whispering]);
 
-  const handleVoiceTranscript = useCallback(
-    (raw: string) => {
-      const normalized = normalizeSpeechText(raw);
-      const intent = parseVoiceIntent(normalized);
-      if (intent === "start") {
-        setApiError(null);
-        speakUi("Starting watch.");
-        startWhisper();
-        return;
-      }
-      if (intent === "stop") {
-        speakUi("Stopping watch.");
-        stopWhisper();
-        return;
-      }
-      if (transcriptHasWakePhrase(normalized) && !intent) {
-        speakError(
-          "I did not understand. Say hey blindr, then start watching, or hey blindr, stop.",
-        );
-      }
-    },
-    [speakError, speakUi, startWhisper, stopWhisper],
-  );
-
-  useEffect(() => {
-    const Rec = getSpeechRecognition();
-    if (!Rec) {
-      voiceListenEnabledRef.current = false;
+    const Ctor = getSpeechRecognitionCtor();
+    if (!Ctor) {
+      wakeListenEnabledRef.current = false;
       setVoiceStatus(
         "Voice commands need a browser with speech recognition (for example Chrome with HTTPS). Buttons still work.",
       );
       return;
     }
 
-    if (!onboardingDone) {
-      voiceListenEnabledRef.current = false;
-      return;
-    }
-
-    const rec = new Rec();
-    recognitionRef.current = rec;
+    const rec = new Ctor();
+    wakeRecognitionRef.current = rec;
     rec.continuous = true;
     rec.interimResults = false;
     rec.lang = "en-US";
     rec.maxAlternatives = 1;
+    rec.onspeechstart = null;
 
-    voiceListenEnabledRef.current = true;
+    wakeListenEnabledRef.current = true;
     setVoiceStatus("Listening for: hey blindr, then start or stop.");
 
-    rec.onresult = (event: SpeechRecognitionEvent) => {
+    rec.onresult = (ev) => {
+      const startIdx = typeof ev.resultIndex === "number" ? ev.resultIndex : 0;
       let said = "";
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        said += event.results[i][0].transcript;
+      for (let i = startIdx; i < ev.results.length; i += 1) {
+        const r = ev.results[i];
+        const alt = r[0];
+        if (alt) said += alt.transcript;
       }
       if (said.trim()) handleVoiceTranscript(said);
     };
 
-    rec.onerror = (event: SpeechRecognitionErrorEvent) => {
-      if (event.error === "not-allowed") {
+    rec.onerror = (ev) => {
+      if (ev.error === "not-allowed") {
         setVoiceStatus("Microphone denied. Allow mic for voice commands, or use buttons.");
-      } else if (event.error !== "aborted" && event.error !== "no-speech") {
-        setVoiceStatus(`Voice recognition paused (${event.error}). Will retry.`);
+      } else if (ev.error !== "aborted" && ev.error !== "no-speech") {
+        setVoiceStatus(`Voice recognition paused (${ev.error}). Will retry.`);
       }
     };
 
     rec.onend = () => {
-      if (voiceListenEnabledRef.current && !sceneAudioPlayingRef.current) {
+      if (wakeListenEnabledRef.current && !whisperingRef.current) {
         try {
           rec.start();
         } catch {
@@ -388,7 +452,8 @@ export function App() {
     }
 
     return () => {
-      voiceListenEnabledRef.current = false;
+      wakeListenEnabledRef.current = false;
+      wakeRecognitionRef.current = null;
       try {
         rec.abort();
       } catch {
@@ -398,9 +463,104 @@ export function App() {
           /* noop */
         }
       }
-      recognitionRef.current = null;
     };
-  }, [handleVoiceTranscript, onboardingDone]);
+  }, [handleVoiceTranscript, onboardingDone, whispering]);
+
+  // Barge-in: speech recognition while watching (questions + hey blindr stop)
+  useEffect(() => {
+    if (!whispering) return;
+
+    stopWakeRecognitionSafe();
+
+    const Ctor = getSpeechRecognitionCtor();
+    if (!Ctor) {
+      setStatusMessage("Voice interrupt unsupported in this browser.");
+      return;
+    }
+
+    const rec = new Ctor();
+    bargeRecognitionRef.current = rec;
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.lang = navigator.language || "en-US";
+
+    let restartTimer: number | undefined;
+    let stopped = false;
+
+    rec.onspeechstart = () => {
+      if (!whisperingRef.current) return;
+      stopPlayback();
+      graceUntilRef.current = Date.now() + GRACE_MS;
+      setStatusMessage("Listening to you.");
+    };
+
+    rec.onresult = (ev) => {
+      if (!whisperingRef.current) return;
+      let finalText = "";
+      let interim = "";
+      for (let i = 0; i < ev.results.length; i += 1) {
+        const r = ev.results[i];
+        const alt = r[0];
+        if (!alt) continue;
+        if (r.isFinal) finalText += alt.transcript;
+        else interim += alt.transcript;
+      }
+      if (interim && !finalText) {
+        stopPlayback();
+        graceUntilRef.current = Date.now() + GRACE_MS;
+      }
+      if (finalText) {
+        const cleaned = finalText.trim();
+        if (!cleaned) return;
+        setLastHeard(cleaned);
+        const normalized = normalizeSpeechText(cleaned);
+        if (parseVoiceIntent(normalized) === "stop") {
+          stopWhisper();
+          return;
+        }
+        pendingQueryRef.current = cleaned;
+        graceUntilRef.current = Date.now() + GRACE_MS;
+        void sendFrame({ force: true });
+      }
+    };
+
+    rec.onerror = (ev) => {
+      if (ev.error === "no-speech" || ev.error === "aborted") return;
+      setStatusMessage(`Speech recognition error: ${ev.error}`);
+    };
+
+    rec.onend = () => {
+      if (stopped || !whisperingRef.current) return;
+      restartTimer = window.setTimeout(() => {
+        try {
+          rec.start();
+        } catch {
+          /* already started or mic denied */
+        }
+      }, 200);
+    };
+
+    try {
+      rec.start();
+    } catch {
+      setStatusMessage("Microphone denied or unavailable.");
+    }
+
+    return () => {
+      stopped = true;
+      if (restartTimer) window.clearTimeout(restartTimer);
+      rec.onresult = null;
+      rec.onspeechstart = null;
+      rec.onerror = null;
+      rec.onend = null;
+      try {
+        rec.abort();
+      } catch {
+        /* noop */
+      }
+      bargeRecognitionRef.current = null;
+    };
+  }, [whispering, sendFrame, stopPlayback, stopWakeRecognitionSafe, stopWhisper]);
 
   const replayOnboarding = useCallback(() => {
     if (typeof speechSynthesis !== "undefined") speechSynthesis.cancel();
@@ -408,6 +568,10 @@ export function App() {
     localStorage.removeItem(ONBOARDING_STORAGE_KEY);
     setOnboardingDone(false);
   }, []);
+
+  useEffect(() => {
+    if (whispering) stopRef.current?.focus();
+  }, [whispering]);
 
   return (
     <>
@@ -419,21 +583,28 @@ export function App() {
           <h1>Blind Whisperer</h1>
           <p className="lead">
             Sends camera snapshots to your server for vision plus speech. Use headphones in public
-            spaces. Say <span className="nowrap">{WAKE_PHRASE}</span>, then{" "}
+            spaces. Before watching, say <span className="nowrap">{WAKE_PHRASE}</span>, then{" "}
             <span className="nowrap">start watching</span> or <span className="nowrap">stop</span>.
+            While watching, speak any time to interrupt and ask a question.
           </p>
         </header>
 
         <main id="main" tabIndex={-1}>
           <section className="panel" aria-labelledby="voice-heading">
             <h2 id="voice-heading">Voice</h2>
-            <p id={voiceStatusId} role="status" aria-live="polite" className="transcript" style={{ marginTop: 0 }}>
+            <p
+              id={voiceStatusId}
+              role="status"
+              aria-live="polite"
+              className="transcript"
+              style={{ marginTop: 0 }}
+            >
               {voiceStatus}
             </p>
             <p className="help-text">
-              Web Speech API is used for commands (offline in many browsers). Requires a secure
-              context (HTTPS or localhost). Speech recognition may send audio to your browser
-              vendor; see your browser documentation.
+              Web Speech API is used for commands and questions. Requires a secure context (HTTPS or
+              localhost). Speech recognition may send audio to your browser vendor; see your browser
+              documentation.
             </p>
             <div className="controls">
               <button type="button" className="btn-ghost" onClick={replayOnboarding}>
@@ -444,7 +615,13 @@ export function App() {
 
           <section className="panel" aria-labelledby="camera-heading">
             <h2 id="camera-heading">Camera</h2>
-            <p id={statusId} role="status" aria-live="polite" className="transcript" style={{ marginTop: 0 }}>
+            <p
+              id={statusId}
+              role="status"
+              aria-live="polite"
+              className="transcript"
+              style={{ marginTop: 0 }}
+            >
               {statusMessage}
             </p>
             <div className="video-wrap" aria-hidden={!whispering}>
@@ -505,6 +682,11 @@ export function App() {
                 </p>
               )}
             </div>
+            {lastHeard ? (
+              <p className="transcript" style={{ color: "var(--muted)" }}>
+                Heard: "{lastHeard}"
+              </p>
+            ) : null}
           </section>
         </main>
 
