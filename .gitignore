@@ -17,3 +17,10 @@ dist/
 
 # OS
 .DS_Store
+
+# Capacitor native (keep projects; ignore local build cruft)
+frontend/android/.gradle/
+frontend/android/**/build/
+frontend/android/local.properties
+frontend/ios/App/Pods/
+frontend/ios/**/xcuserdata/
