@@ -38,11 +38,15 @@ type ScenePayload = {
 
 type Turn = { role: "user" | "assistant"; text: string };
 
-// Voice activity detection thresholds (tune if mic sensitivity differs).
-const VAD_SPEECH_RMS = 0.03; // start recording above this RMS
+// Voice activity detection thresholds. The threshold is adaptive: it tracks a rolling noise
+// floor, so in a loud room only louder-than-ambient speech (the user's own voice, since they
+// are closest to the mic) crosses the bar.
+const VAD_BASE_RMS = 0.04; // absolute floor, never go below this
+const VAD_NOISE_MULTIPLIER = 3.0; // speech must exceed noise floor by this factor
 const VAD_SILENCE_MS = 900; // stop recording after this much continuous silence
-const VAD_MIN_UTTERANCE_MS = 350; // drop utterances shorter than this (cough / click)
+const VAD_MIN_UTTERANCE_MS = 400; // drop utterances shorter than this (cough / click)
 const VAD_MAX_UTTERANCE_MS = 9000; // hard cap on a single clip
+const VAD_MIN_TRANSCRIPT_WORDS = 2; // STT output shorter than this is likely noise
 
 function pickRecorderMime(): string {
   const MR = (window as unknown as { MediaRecorder?: typeof MediaRecorder }).MediaRecorder;
@@ -238,19 +242,6 @@ export function App() {
     if (el) el.setAttribute("aria-live", priority);
   }, [voiceStatusId]);
 
-  const speakError = useCallback(
-    (text: string) => {
-      speakUi(text, "assertive");
-      if (typeof speechSynthesis !== "undefined") {
-        speechSynthesis.cancel();
-        const u = new SpeechSynthesisUtterance(text);
-        u.rate = 1;
-        speechSynthesis.speak(u);
-      }
-    },
-    [speakUi],
-  );
-
   const playOnboarding = useCallback(() => {
     if (typeof speechSynthesis === "undefined") {
       localStorage.setItem(ONBOARDING_STORAGE_KEY, "1");
@@ -350,8 +341,9 @@ export function App() {
   }, []);
 
   const sendFrame = useCallback(
-    async (opts?: { force?: boolean }) => {
-      if (!whisperingRef.current || inFlightRef.current) return;
+    async (opts?: { force?: boolean; oneShot?: boolean }) => {
+      if (inFlightRef.current) return;
+      if (!opts?.oneShot && !whisperingRef.current) return;
       if (!opts?.force && Date.now() < graceUntilRef.current) return;
 
       const blob = await captureFrameBlob();
@@ -458,60 +450,101 @@ export function App() {
         stopWhisper();
         return;
       }
-      if (transcriptHasWakePhrase(normalized) && !intent) {
-        speakError(
-          "I did not understand. Say hey blindr, then start watching, or hey blindr, stop. Say hey blindr, pause listening to mute the microphone.",
-        );
+      if (transcriptHasWakePhrase(normalized)) {
+        const tail = textAfterWakePhrase(normalized);
+        if (tail.length === 0) {
+          speakUi("Yes? Ask a question, or say start watching.");
+          return;
+        }
+        // Question for the assistant. Capture the current frame and answer.
+        // During watching we queue the query for the running interval; otherwise one-shot.
+        pendingQueryRef.current = tail;
+        pushTurn("user", tail);
+        setLastHeard(tail);
+        speakUi(`Checking: ${tail}`);
+        if (whisperingRef.current) {
+          stopPlayback();
+          graceUntilRef.current = Date.now() + GRACE_MS;
+          void sendFrame({ force: true });
+        } else {
+          void sendFrame({ force: true, oneShot: true });
+        }
+        return;
       }
+      // No wake phrase — background noise / conversation. Ignore.
+      console.debug("[voice] dropping transcript without wake phrase", { raw });
     },
-    [pauseMicListening, resumeMicListeningFromVoice, speakError, speakUi, startWhisper, stopWhisper],
+    [
+      pauseMicListening,
+      pushTurn,
+      resumeMicListeningFromVoice,
+      sendFrame,
+      speakUi,
+      startWhisper,
+      stopPlayback,
+      stopWhisper,
+    ],
   );
 
-  // Camera + auto-capture loop
+  // Live camera preview — starts as soon as onboarding is done, stays on for the whole session.
   useEffect(() => {
-    if (!whispering) return;
+    if (!onboardingDone) return;
 
     let stream: MediaStream | null = null;
-    let timer: number | undefined;
+    let cancelled = false;
 
     const start = async () => {
       setCameraError(null);
-      setApiError(null);
-      historyRef.current = [];
-      pendingQueryRef.current = null;
-      graceUntilRef.current = 0;
-
       try {
         stream = await navigator.mediaDevices.getUserMedia({
           video: { facingMode: "environment" },
           audio: false,
         });
-        const video = videoRef.current;
-        if (video) {
-          video.srcObject = stream;
-          await video.play();
-        }
-        setStatusMessage("Camera on. First snapshot soon.");
-        await sendFrame();
-        timer = window.setInterval(() => {
-          void sendFrame();
-        }, Math.max(2, intervalSec) * 1000);
       } catch (e) {
         const msg = e instanceof Error ? e.message : "Could not access camera.";
         setCameraError(msg);
-        setWhispering(false);
         setStatusMessage("Camera could not start.");
+        return;
       }
+      if (cancelled) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+      const video = videoRef.current;
+      if (video) {
+        video.srcObject = stream;
+        try {
+          await video.play();
+        } catch {
+          /* iOS may block autoplay until user gesture — the stage's tap handler covers that */
+        }
+      }
+      setStatusMessage("Camera ready. Say hey blindr to ask a question.");
     };
 
     void start();
 
     return () => {
-      if (timer) window.clearInterval(timer);
+      cancelled = true;
       const video = videoRef.current;
       if (video) video.srcObject = null;
       stream?.getTracks().forEach((t) => t.stop());
     };
+  }, [onboardingDone]);
+
+  // Auto-capture loop when user says "start watching" — uses the already-live camera.
+  useEffect(() => {
+    if (!whispering) return;
+    historyRef.current = [];
+    pendingQueryRef.current = null;
+    graceUntilRef.current = 0;
+    setApiError(null);
+    setStatusMessage("Watching. Describing the scene.");
+    void sendFrame();
+    const timer = window.setInterval(() => {
+      void sendFrame();
+    }, Math.max(2, intervalSec) * 1000);
+    return () => window.clearInterval(timer);
   }, [whispering, intervalSec, sendFrame]);
 
   // Continuous capture: VAD-driven MediaRecorder → POST /api/stt → transcript pipeline.
@@ -535,6 +568,9 @@ export function App() {
     let silenceStart: number | null = null;
     let recordStart = 0;
     let cancelled = false;
+    // Adaptive noise floor — slowly tracks ambient RMS when no speech is active, so the
+    // speech threshold floats above room noise (chatter, HVAC, traffic, etc.).
+    let noiseFloor = 0.015;
 
     const stopRecordingSoon = () => {
       if (recorder && recorder.state !== "inactive") {
@@ -578,9 +614,7 @@ export function App() {
       recordStart = performance.now();
       console.debug("[voice:vad] recording started", { mime });
       if (whisperingRef.current) {
-        stopPlayback();
-        graceUntilRef.current = Date.now() + GRACE_MS;
-        setStatusMessage("Listening to you.");
+        setStatusMessage("Listening.");
       }
     };
 
@@ -598,20 +632,16 @@ export function App() {
         const text = (data.text || "").trim();
         console.debug("[voice:stt] transcript", { text, bytes: blob.size });
         if (!text) return;
-        setLastHeard(text);
-        if (whisperingRef.current) {
-          const normalized = normalizeSpeechText(text);
-          const intent = parseVoiceIntent(normalized);
-          if (intent === "stop") {
-            stopWhisper();
-            return;
-          }
-          pendingQueryRef.current = text;
-          graceUntilRef.current = Date.now() + GRACE_MS;
-          void sendFrame({ force: true });
-        } else {
-          handleVoiceTranscript(text);
+        // Drop STT noise artifacts: very short transcripts are usually stray sounds.
+        const wordCount = text.split(/\s+/).filter(Boolean).length;
+        if (wordCount < VAD_MIN_TRANSCRIPT_WORDS) {
+          console.debug("[voice:stt] dropping short transcript", { text, wordCount });
+          return;
         }
+        // In a noisy room we only want to act on speech addressed to the assistant.
+        // handleVoiceTranscript already no-ops on anything without the wake phrase.
+        setLastHeard(text);
+        handleVoiceTranscript(text);
       } catch (e) {
         console.warn("[voice:stt] upload failed", e);
       }
@@ -627,15 +657,22 @@ export function App() {
       const rms = Math.sqrt(sum / bufLen);
       const now = performance.now();
 
-      if (rms > VAD_SPEECH_RMS) {
+      const threshold = Math.max(VAD_BASE_RMS, noiseFloor * VAD_NOISE_MULTIPLIER);
+
+      if (rms > threshold) {
         silenceStart = null;
         if (!recorder) startRecording();
-      } else if (recorder) {
-        if (silenceStart === null) silenceStart = now;
-        const silent = now - silenceStart;
-        const recording = now - recordStart;
-        if (silent >= VAD_SILENCE_MS || recording >= VAD_MAX_UTTERANCE_MS) {
-          stopRecordingSoon();
+      } else {
+        // Only update the noise floor when not actively recording, using a slow EWMA so
+        // sporadic loud moments don't immediately raise the bar.
+        if (!recorder) noiseFloor = noiseFloor * 0.98 + rms * 0.02;
+        if (recorder) {
+          if (silenceStart === null) silenceStart = now;
+          const silent = now - silenceStart;
+          const recording = now - recordStart;
+          if (silent >= VAD_SILENCE_MS || recording >= VAD_MAX_UTTERANCE_MS) {
+            stopRecordingSoon();
+          }
         }
       }
 
