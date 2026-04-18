@@ -5,7 +5,7 @@ from typing import Annotated
 import httpx
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from openai import OpenAI
+from openai import AzureOpenAI, OpenAI
 from pydantic import BaseModel
 
 from app.config import Settings, settings
@@ -44,8 +44,24 @@ async def describe_scene(
     image: Annotated[UploadFile, File(description="Camera frame as JPEG or PNG")],
     s: Annotated[Settings, Depends(get_settings)],
 ):
-    if not s.openai_api_key:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured")
+    provider = s.openai_provider.lower()
+    if provider == "azure":
+        if not s.azure_openai_api_key or not s.azure_openai_endpoint or not s.azure_openai_deployment:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, and "
+                    "AZURE_OPENAI_DEPLOYMENT must be configured for Azure"
+                ),
+            )
+    elif provider == "openai":
+        if not s.openai_api_key:
+            raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured")
+    else:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unsupported OPENAI_PROVIDER: {s.openai_provider!r} (expected 'openai' or 'azure')",
+        )
     if not s.elevenlabs_api_key or not s.elevenlabs_voice_id:
         raise HTTPException(
             status_code=500,
@@ -63,10 +79,24 @@ async def describe_scene(
     b64 = base64.b64encode(raw).decode("ascii")
     data_url = f"data:{mime};base64,{b64}"
 
-    client = OpenAI(api_key=s.openai_api_key)
+    if provider == "azure":
+        endpoint = s.azure_openai_endpoint.rstrip("/")
+        # Strip Foundry project path ("/api/projects/<name>") — OpenAI SDK needs the resource root.
+        marker = "/api/projects/"
+        if marker in endpoint:
+            endpoint = endpoint.split(marker, 1)[0]
+        client = AzureOpenAI(
+            api_key=s.azure_openai_api_key,
+            azure_endpoint=endpoint,
+            api_version=s.azure_openai_api_version,
+        )
+        model = s.azure_openai_deployment
+    else:
+        client = OpenAI(api_key=s.openai_api_key)
+        model = s.openai_model
     try:
         completion = client.chat.completions.create(
-            model=s.openai_model,
+            model=model,
             messages=[
                 {
                     "role": "system",
@@ -91,8 +121,8 @@ async def describe_scene(
             max_tokens=300,
         )
     except Exception as exc:  # noqa: BLE001
-        logger.exception("OpenAI vision failed")
-        raise HTTPException(status_code=502, detail=f"OpenAI error: {exc}") from exc
+        logger.exception("%s vision failed", provider)
+        raise HTTPException(status_code=502, detail=f"{provider} error: {exc}") from exc
 
     description = (completion.choices[0].message.content or "").strip()
     if not description:
