@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import logging
 from typing import Annotated
@@ -46,13 +47,19 @@ async def describe_scene(
 ):
     provider = s.openai_provider.lower()
     if provider == "azure":
-        if not s.azure_openai_api_key or not s.azure_openai_endpoint or not s.azure_openai_deployment:
+        missing = [
+            name
+            for name, value in (
+                ("AZURE_OPENAI_API_KEY", s.azure_openai_api_key),
+                ("AZURE_OPENAI_ENDPOINT", s.azure_openai_endpoint),
+                ("AZURE_OPENAI_DEPLOYMENT", s.azure_openai_deployment),
+            )
+            if not value
+        ]
+        if missing:
             raise HTTPException(
                 status_code=500,
-                detail=(
-                    "AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, and "
-                    "AZURE_OPENAI_DEPLOYMENT must be configured for Azure"
-                ),
+                detail=f"Missing Azure settings: {', '.join(missing)}",
             )
     elif provider == "openai":
         if not s.openai_api_key:
@@ -129,23 +136,30 @@ async def describe_scene(
         raise HTTPException(status_code=502, detail="Empty description from model")
 
     tts_url = f"https://api.elevenlabs.io/v1/text-to-speech/{s.elevenlabs_voice_id}"
+    tts_resp = None
     try:
         async with httpx.AsyncClient(timeout=60.0) as http:
-            tts_resp = await http.post(
-                tts_url,
-                headers={
-                    "xi-api-key": s.elevenlabs_api_key,
-                    "Accept": "audio/mpeg",
-                },
-                json={
-                    "text": description,
-                    "model_id": s.elevenlabs_model_id,
-                },
-            )
+            for attempt in range(4):
+                tts_resp = await http.post(
+                    tts_url,
+                    headers={
+                        "xi-api-key": s.elevenlabs_api_key,
+                        "Accept": "audio/mpeg",
+                    },
+                    json={
+                        "text": description,
+                        "model_id": s.elevenlabs_model_id,
+                    },
+                )
+                # Retry transient contention on the same voice (409 already_running, 429 rate-limit).
+                if tts_resp.status_code not in (409, 429) or attempt == 3:
+                    break
+                await asyncio.sleep(0.4 * (2**attempt))
     except httpx.HTTPError as exc:
         logger.exception("ElevenLabs request failed")
         raise HTTPException(status_code=502, detail=f"ElevenLabs network error: {exc}") from exc
 
+    assert tts_resp is not None
     if tts_resp.status_code >= 400:
         raise HTTPException(
             status_code=502,
