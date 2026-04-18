@@ -73,6 +73,17 @@ function parseVoiceIntent(normalizedFull: string): "start" | "stop" | null {
   return null;
 }
 
+/** Pause or resume wake listening (not the camera watch session). */
+function parseWakeListeningControl(normalizedFull: string): "pause" | "resume" | null {
+  if (!transcriptHasWakePhrase(normalizedFull)) return null;
+  const tail = textAfterWakePhrase(normalizedFull);
+  const cmd = tail.length > 0 ? tail : normalizedFull;
+
+  if (/\b(pause|stop|mute)\s+listening\b/.test(cmd)) return "pause";
+  if (/\b(resume|unmute)\s+listening\b/.test(cmd)) return "resume";
+  return null;
+}
+
 export function App() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -96,6 +107,10 @@ export function App() {
   const [onboardingDone, setOnboardingDone] = useState(
     () => typeof localStorage !== "undefined" && localStorage.getItem(ONBOARDING_STORAGE_KEY) === "1",
   );
+  /** When true, wake recognition is off for privacy; user can resume via UI or voice. */
+  const [micListeningPaused, setMicListeningPaused] = useState(false);
+  /** Browsers may require a user gesture before SpeechRecognition.start(); then show Enable. */
+  const [wakeNeedsUserGesture, setWakeNeedsUserGesture] = useState(false);
 
   const whisperingRef = useRef(false);
   const inFlightRef = useRef(false);
@@ -103,10 +118,18 @@ export function App() {
   const pendingQueryRef = useRef<string | null>(null);
   const graceUntilRef = useRef(0);
   const wakeListenEnabledRef = useRef(false);
+  const micListeningPausedRef = useRef(false);
+  /** Avoids double attach when Resume is clicked (gesture) and the effect runs on the same state. */
+  const skipNextWakeEffectAttachRef = useRef(false);
+  const onWakeTranscriptRef = useRef<(raw: string) => void>(() => {});
 
   useEffect(() => {
     whisperingRef.current = whispering;
   }, [whispering]);
+
+  useEffect(() => {
+    micListeningPausedRef.current = micListeningPaused;
+  }, [micListeningPaused]);
 
   const speakUi = useCallback((text: string, priority: "polite" | "assertive" = "polite") => {
     setVoiceStatus(text);
@@ -138,9 +161,11 @@ export function App() {
       "Welcome to Blind Whisperer.",
       "This app uses your camera to capture snapshots, sends them to your server for vision understanding, then speaks a short description through Eleven Labs.",
       "Grant camera access when asked so the app can see the scene. For voice commands, your browser may ask for microphone access for speech recognition.",
+      "After this message, the microphone stays on for voice commands by default. Say hey blindr, pause listening to stop the microphone, or hey blindr, resume listening to turn it back on. You can also use the pause and resume buttons on screen.",
+      "If the browser requires a tap first, use the Enable microphone listening button when it appears.",
       "While watching, you can speak any time to interrupt and ask a question about the scene.",
       "To start hands-free before watching, say: hey blindr, then start watching.",
-      "To stop, say: hey blindr, stop.",
+      "To stop the camera session, say: hey blindr, stop.",
       "Privacy note: camera frames are sent to your server and may be processed by third party services. Use a secure connection in production.",
     ].join(" ");
 
@@ -286,6 +311,22 @@ export function App() {
     }
   }, []);
 
+  const abortWakeRecognition = useCallback(() => {
+    wakeListenEnabledRef.current = false;
+    const rec = wakeRecognitionRef.current;
+    wakeRecognitionRef.current = null;
+    if (!rec) return;
+    try {
+      rec.abort();
+    } catch {
+      try {
+        rec.stop();
+      } catch {
+        /* noop */
+      }
+    }
+  }, []);
+
   const startWhisper = useCallback(() => {
     setWhispering(true);
   }, []);
@@ -302,12 +343,126 @@ export function App() {
       }
     }
     setStatusMessage("Whispering stopped.");
-    speakUi("Listening for: hey blindr, then start or stop.");
+    speakUi("Microphone listening is on. Say hey blindr, then start or stop.");
   }, [speakUi, stopPlayback]);
+
+  const pauseMicListening = useCallback(() => {
+    setWakeNeedsUserGesture(false);
+    abortWakeRecognition();
+    setMicListeningPaused(true);
+    speakUi(
+      "Microphone listening paused. Say hey blindr, resume listening, or use the Resume button.",
+    );
+  }, [abortWakeRecognition, speakUi]);
+
+  const attachWakeRecognition = useCallback((): boolean => {
+    const Ctor = getSpeechRecognitionCtor();
+    if (!Ctor) {
+      setWakeNeedsUserGesture(false);
+      setVoiceStatus(
+        "Voice commands need a browser with speech recognition (for example Chrome with HTTPS). Buttons still work.",
+      );
+      return false;
+    }
+
+    abortWakeRecognition();
+
+    const rec = new Ctor();
+    wakeRecognitionRef.current = rec;
+    rec.continuous = true;
+    rec.interimResults = false;
+    rec.lang = "en-US";
+    rec.maxAlternatives = 1;
+    rec.onspeechstart = null;
+
+    rec.onresult = (ev) => {
+      const startIdx = typeof ev.resultIndex === "number" ? ev.resultIndex : 0;
+      let said = "";
+      for (let i = startIdx; i < ev.results.length; i += 1) {
+        const r = ev.results[i];
+        const alt = r[0];
+        if (alt) said += alt.transcript;
+      }
+      if (said.trim()) onWakeTranscriptRef.current(said);
+    };
+
+    rec.onerror = (ev) => {
+      if (ev.error === "not-allowed") {
+        setWakeNeedsUserGesture(false);
+        wakeListenEnabledRef.current = false;
+        setVoiceStatus("Microphone denied. Allow mic for voice commands, or use buttons.");
+      } else if (ev.error === "service-not-allowed") {
+        setWakeNeedsUserGesture(true);
+        speakUi("Tap Enable microphone listening to start the microphone.");
+      } else if (ev.error !== "aborted" && ev.error !== "no-speech") {
+        setVoiceStatus(`Voice recognition issue (${ev.error}).`);
+      }
+    };
+
+    rec.onend = () => {
+      if (
+        wakeListenEnabledRef.current &&
+        !whisperingRef.current &&
+        !micListeningPausedRef.current
+      ) {
+        try {
+          rec.start();
+          setWakeNeedsUserGesture(false);
+        } catch {
+          setWakeNeedsUserGesture(true);
+          speakUi("Tap Enable microphone listening to resume.");
+        }
+      }
+    };
+
+    try {
+      rec.start();
+      wakeListenEnabledRef.current = true;
+      setWakeNeedsUserGesture(false);
+      setVoiceStatus("Microphone listening is on. Say hey blindr, then start or stop.");
+      return true;
+    } catch {
+      wakeListenEnabledRef.current = false;
+      try {
+        rec.abort();
+      } catch {
+        /* noop */
+      }
+      wakeRecognitionRef.current = null;
+      setWakeNeedsUserGesture(true);
+      setVoiceStatus(
+        "Microphone listening needs a tap or key press in this browser. Tap Enable microphone listening.",
+      );
+      speakUi(
+        "Tap Enable microphone listening. Some browsers require a tap or key press before the microphone can start.",
+      );
+      return false;
+    }
+  }, [abortWakeRecognition, speakUi]);
+
+  const resumeMicListening = useCallback(() => {
+    skipNextWakeEffectAttachRef.current = true;
+    setMicListeningPaused(false);
+    void attachWakeRecognition();
+  }, [attachWakeRecognition]);
+
+  const resumeMicListeningFromVoice = useCallback(() => {
+    speakUi("Resuming microphone listening.");
+    resumeMicListening();
+  }, [resumeMicListening, speakUi]);
 
   const handleVoiceTranscript = useCallback(
     (raw: string) => {
       const normalized = normalizeSpeechText(raw);
+      const listenCtl = parseWakeListeningControl(normalized);
+      if (listenCtl === "pause") {
+        pauseMicListening();
+        return;
+      }
+      if (listenCtl === "resume") {
+        resumeMicListeningFromVoice();
+        return;
+      }
       const intent = parseVoiceIntent(normalized);
       if (intent === "start") {
         setApiError(null);
@@ -322,12 +477,20 @@ export function App() {
       }
       if (transcriptHasWakePhrase(normalized) && !intent) {
         speakError(
-          "I did not understand. Say hey blindr, then start watching, or hey blindr, stop.",
+          "I did not understand. Say hey blindr, then start watching, or hey blindr, stop. Say hey blindr, pause listening to mute the microphone.",
         );
       }
     },
-    [speakError, speakUi, startWhisper, stopWhisper],
+    [pauseMicListening, resumeMicListeningFromVoice, speakError, speakUi, startWhisper, stopWhisper],
   );
+
+  useEffect(() => {
+    onWakeTranscriptRef.current = handleVoiceTranscript;
+  }, [handleVoiceTranscript]);
+
+  const enableMicListeningFromGesture = useCallback(() => {
+    void attachWakeRecognition();
+  }, [attachWakeRecognition]);
 
   // Camera + auto-capture loop
   useEffect(() => {
@@ -376,99 +539,35 @@ export function App() {
     };
   }, [whispering, intervalSec, sendFrame]);
 
-  // Wake phrase + start/stop when not in a watch session
+  // Wake phrase + start/stop when not watching (mic on by default after onboarding)
   useEffect(() => {
-    if (!onboardingDone || whispering) {
-      wakeListenEnabledRef.current = false;
-      const rec = wakeRecognitionRef.current;
-      wakeRecognitionRef.current = null;
-      if (rec) {
-        try {
-          rec.abort();
-        } catch {
-          try {
-            rec.stop();
-          } catch {
-            /* noop */
-          }
-        }
-      }
+    if (!onboardingDone || whispering || micListeningPaused) {
+      setWakeNeedsUserGesture(false);
+      abortWakeRecognition();
       return;
     }
 
-    const Ctor = getSpeechRecognitionCtor();
-    if (!Ctor) {
-      wakeListenEnabledRef.current = false;
-      setVoiceStatus(
-        "Voice commands need a browser with speech recognition (for example Chrome with HTTPS). Buttons still work.",
-      );
+    if (skipNextWakeEffectAttachRef.current) {
+      skipNextWakeEffectAttachRef.current = false;
       return;
     }
 
-    const rec = new Ctor();
-    wakeRecognitionRef.current = rec;
-    rec.continuous = true;
-    rec.interimResults = false;
-    rec.lang = "en-US";
-    rec.maxAlternatives = 1;
-    rec.onspeechstart = null;
-
-    wakeListenEnabledRef.current = true;
-    setVoiceStatus("Listening for: hey blindr, then start or stop.");
-
-    rec.onresult = (ev) => {
-      const startIdx = typeof ev.resultIndex === "number" ? ev.resultIndex : 0;
-      let said = "";
-      for (let i = startIdx; i < ev.results.length; i += 1) {
-        const r = ev.results[i];
-        const alt = r[0];
-        if (alt) said += alt.transcript;
-      }
-      if (said.trim()) handleVoiceTranscript(said);
-    };
-
-    rec.onerror = (ev) => {
-      if (ev.error === "not-allowed") {
-        setVoiceStatus("Microphone denied. Allow mic for voice commands, or use buttons.");
-      } else if (ev.error !== "aborted" && ev.error !== "no-speech") {
-        setVoiceStatus(`Voice recognition paused (${ev.error}). Will retry.`);
-      }
-    };
-
-    rec.onend = () => {
-      if (wakeListenEnabledRef.current && !whisperingRef.current) {
-        try {
-          rec.start();
-        } catch {
-          /* ignore */
-        }
-      }
-    };
-
-    try {
-      rec.start();
-    } catch {
-      setVoiceStatus("Could not start voice recognition. Use buttons to control the app.");
-    }
+    void attachWakeRecognition();
 
     return () => {
-      wakeListenEnabledRef.current = false;
-      wakeRecognitionRef.current = null;
-      try {
-        rec.abort();
-      } catch {
-        try {
-          rec.stop();
-        } catch {
-          /* noop */
-        }
-      }
+      abortWakeRecognition();
     };
-  }, [handleVoiceTranscript, onboardingDone, whispering]);
+  }, [
+    onboardingDone,
+    whispering,
+    micListeningPaused,
+    abortWakeRecognition,
+    attachWakeRecognition,
+  ]);
 
   // Barge-in: speech recognition while watching (questions + hey blindr stop)
   useEffect(() => {
-    if (!whispering) return;
+    if (!whispering || micListeningPaused) return;
 
     stopWakeRecognitionSafe();
 
@@ -560,7 +659,7 @@ export function App() {
       }
       bargeRecognitionRef.current = null;
     };
-  }, [whispering, sendFrame, stopPlayback, stopWakeRecognitionSafe, stopWhisper]);
+  }, [micListeningPaused, whispering, sendFrame, stopPlayback, stopWakeRecognitionSafe, stopWhisper]);
 
   const replayOnboarding = useCallback(() => {
     if (typeof speechSynthesis !== "undefined") speechSynthesis.cancel();
@@ -583,9 +682,11 @@ export function App() {
           <h1>Blind Whisperer</h1>
           <p className="lead">
             Sends camera snapshots to your server for vision plus speech. Use headphones in public
-            spaces. Before watching, say <span className="nowrap">{WAKE_PHRASE}</span>, then{" "}
+            spaces. After onboarding, the microphone is on for voice commands by default. Before
+            watching, say <span className="nowrap">{WAKE_PHRASE}</span>, then{" "}
             <span className="nowrap">start watching</span> or <span className="nowrap">stop</span>.
-            While watching, speak any time to interrupt and ask a question.
+            Say <span className="nowrap">hey blindr, pause listening</span> or use Pause to mute the
+            mic. While watching, speak any time to interrupt and ask a question.
           </p>
         </header>
 
@@ -603,10 +704,28 @@ export function App() {
             </p>
             <p className="help-text">
               Web Speech API is used for commands and questions. Requires a secure context (HTTPS or
-              localhost). Speech recognition may send audio to your browser vendor; see your browser
-              documentation.
+              localhost). Some browsers only start the microphone after you tap or press a key; use
+              Enable microphone listening if it appears. Speech recognition may send audio to your
+              browser vendor; see your browser documentation.
             </p>
             <div className="controls">
+              {wakeNeedsUserGesture ? (
+                <button
+                  type="button"
+                  className="btn-primary"
+                  onClick={enableMicListeningFromGesture}
+                >
+                  Enable microphone listening
+                </button>
+              ) : !micListeningPaused ? (
+                <button type="button" className="btn-ghost" onClick={pauseMicListening}>
+                  Pause microphone listening
+                </button>
+              ) : (
+                <button type="button" className="btn-primary" onClick={resumeMicListening}>
+                  Resume microphone listening
+                </button>
+              )}
               <button type="button" className="btn-ghost" onClick={replayOnboarding}>
                 Replay spoken onboarding
               </button>
