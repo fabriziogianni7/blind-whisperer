@@ -5,7 +5,6 @@ import { useCallback, useEffect, useId, useRef, useState } from "react";
 const apiBase = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
 
 const ONBOARDING_STORAGE_KEY = "blind-whisperer-onboarding-done-v1";
-const WAKE_PHRASE = "hey blindr";
 // Speech recognizers mishear the coined word "blindr". Accept common substitutions
 // produced by Chrome/Safari so the wake phrase still triggers reliably.
 const WAKE_WORD_VARIANTS = [
@@ -125,7 +124,7 @@ export function App() {
   const voiceStatusId = useId();
 
   const [whispering, setWhispering] = useState(false);
-  const [intervalSec, setIntervalSec] = useState(5);
+  const [intervalSec] = useState(5);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [apiError, setApiError] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState("Camera idle.");
@@ -429,11 +428,6 @@ export function App() {
     );
   }, [speakUi]);
 
-  const resumeMicListening = useCallback(() => {
-    setMicListeningPaused(false);
-    speakUi("Microphone listening is on. Say hey blindr, then start or stop.");
-  }, [speakUi]);
-
   const resumeMicListeningFromVoice = useCallback(() => {
     speakUi("Resuming microphone listening.");
     setMicListeningPaused(false);
@@ -710,155 +704,41 @@ export function App() {
     stopWhisper,
   ]);
 
-  const replayOnboarding = useCallback(() => {
-    if (typeof speechSynthesis !== "undefined") speechSynthesis.cancel();
-    onboardingPlaybackSessionStarted = false;
-    localStorage.removeItem(ONBOARDING_STORAGE_KEY);
-    setOnboardingDone(false);
-  }, []);
-
   useEffect(() => {
     if (whispering) stopRef.current?.focus();
   }, [whispering]);
 
+  const needsTap = micGranted !== true;
+  const onStageTap = needsTap ? () => void requestMicPermission() : undefined;
+
   return (
-    <>
-      <a className="skip-link" href="#main">
-        Skip to main content
-      </a>
-      <div className="app-shell">
-        <header>
-          <h1>Blind Whisperer</h1>
-          <p className="lead">
-            Sends camera snapshots to your server for vision plus speech. Use headphones in public
-            spaces. After onboarding, the microphone is on for voice commands by default. Before
-            watching, say <span className="nowrap">{WAKE_PHRASE}</span>, then{" "}
-            <span className="nowrap">start watching</span> or <span className="nowrap">stop</span>.
-            Say <span className="nowrap">hey blindr, pause listening</span> or use Pause to mute the
-            mic. While watching, speak any time to interrupt and ask a question.
-          </p>
-        </header>
+    <div
+      className="stage"
+      onClick={onStageTap}
+      role={needsTap ? "button" : undefined}
+      tabIndex={needsTap ? 0 : -1}
+      aria-label={needsTap ? "Tap anywhere to enable the microphone" : undefined}
+    >
+      <video ref={videoRef} className="stage-video" playsInline muted />
+      <canvas ref={canvasRef} className="visually-hidden" />
 
-        <main id="main" tabIndex={-1}>
-          <section className="panel" aria-labelledby="voice-heading">
-            <h2 id="voice-heading">Voice</h2>
-            <p
-              id={voiceStatusId}
-              role="status"
-              aria-live="polite"
-              className="transcript"
-              style={{ marginTop: 0 }}
-            >
-              {voiceStatus}
-            </p>
-            <p className="help-text">
-              Voice commands and questions are transcribed by ElevenLabs speech-to-text via your
-              backend. Audio is captured locally and uploaded after each utterance.
-            </p>
-            <div className="controls">
-              {!micListeningPaused ? (
-                <button type="button" className="btn-ghost" onClick={pauseMicListening}>
-                  Pause microphone listening
-                </button>
-              ) : (
-                <button type="button" className="btn-primary" onClick={resumeMicListening}>
-                  Resume microphone listening
-                </button>
-              )}
-              <button type="button" className="btn-ghost" onClick={replayOnboarding}>
-                Replay spoken onboarding
-              </button>
-              {micGranted !== true ? (
-                <button
-                  type="button"
-                  className="btn-primary"
-                  onClick={() => void requestMicPermission()}
-                >
-                  {micGranted === false ? "Retry microphone" : "Grant microphone"}
-                </button>
-              ) : null}
-            </div>
-          </section>
-
-          <section className="panel" aria-labelledby="camera-heading">
-            <h2 id="camera-heading">Camera</h2>
-            <p
-              id={statusId}
-              role="status"
-              aria-live="polite"
-              className="transcript"
-              style={{ marginTop: 0 }}
-            >
-              {statusMessage}
-            </p>
-            <div className="video-wrap" aria-hidden={!whispering}>
-              <video ref={videoRef} playsInline muted />
-              <canvas ref={canvasRef} className="visually-hidden" />
-            </div>
-            <div className="controls">
-              {!whispering ? (
-                <button type="button" className="btn-primary" onClick={startWhisper}>
-                  Start whispering
-                </button>
-              ) : (
-                <button ref={stopRef} type="button" className="btn-danger" onClick={stopWhisper}>
-                  Stop whispering
-                </button>
-              )}
-            </div>
-            {cameraError ? (
-              <p className="error" role="alert">
-                {cameraError}
-              </p>
-            ) : null}
-            {apiError ? (
-              <p className="error" role="alert">
-                {apiError}
-              </p>
-            ) : null}
-          </section>
-
-          <section className="panel" aria-labelledby="settings-heading">
-            <h2 id="settings-heading">Timing</h2>
-            <div className="field">
-              <label htmlFor="interval">Seconds between snapshots</label>
-              <input
-                id="interval"
-                type="number"
-                inputMode="numeric"
-                min={2}
-                max={60}
-                value={intervalSec}
-                disabled={whispering}
-                onChange={(e) => setIntervalSec(Number(e.target.value) || 2)}
-              />
-              <span className="visually-hidden" aria-live="polite">
-                Changes apply when whispering is off.
-              </span>
-            </div>
-          </section>
-
-          <section className="panel" aria-labelledby="speech-heading">
-            <h2 id="speech-heading">Last description</h2>
-            <div id={liveId} className="live-region" aria-live="polite" aria-atomic="true">
-              {lastDescription ? (
-                <p className="transcript">{lastDescription}</p>
-              ) : (
-                <p className="transcript" style={{ color: "var(--muted)" }}>
-                  No description yet.
-                </p>
-              )}
-            </div>
-            {lastHeard ? (
-              <p className="transcript" style={{ color: "var(--muted)" }}>
-                Heard: "{lastHeard}"
-              </p>
-            ) : null}
-          </section>
-        </main>
-
-        <audio ref={audioRef} className="visually-hidden" />
-      </div>
-    </>
+      <span id={statusId} role="status" aria-live="polite" className="visually-hidden">
+        {statusMessage}
+      </span>
+      <span id={voiceStatusId} role="status" aria-live="polite" className="visually-hidden">
+        {voiceStatus}
+      </span>
+      <span id={liveId} aria-live="polite" aria-atomic="true" className="visually-hidden">
+        {lastDescription || "No description yet."}
+      </span>
+      {lastHeard ? <span className="visually-hidden">Heard: {lastHeard}</span> : null}
+      {cameraError ? <span className="visually-hidden" role="alert">{cameraError}</span> : null}
+      {apiError ? <span className="visually-hidden" role="alert">{apiError}</span> : null}
+      {/* Keep these refs mounted but not visible — tests/ESLint still expect them. */}
+      <button ref={stopRef} type="button" className="visually-hidden" onClick={stopWhisper}>
+        Stop whispering
+      </button>
+      <audio ref={audioRef} className="visually-hidden" />
+    </div>
   );
 }
