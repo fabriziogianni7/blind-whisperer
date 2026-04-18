@@ -1,10 +1,28 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 
-const DEFAULT_API = "http://127.0.0.1:8000";
-const apiBase = (import.meta.env.VITE_API_BASE_URL || DEFAULT_API).replace(/\/$/, "");
+// Default to same-origin so Vite's /api proxy (see vite.config.ts) handles local dev and ngrok
+// tunnels without CORS. Override with VITE_API_BASE_URL only when hitting a remote backend.
+const apiBase = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
 
 const ONBOARDING_STORAGE_KEY = "blind-whisperer-onboarding-done-v1";
 const WAKE_PHRASE = "hey blindr";
+// Speech recognizers mishear the coined word "blindr". Accept common substitutions
+// produced by Chrome/Safari so the wake phrase still triggers reliably.
+const WAKE_WORD_VARIANTS = [
+  "blindr",
+  "blinder",
+  "blenders",
+  "blender",
+  "blinker",
+  "bliner",
+  "blinders",
+  "binder",
+  "blunder",
+];
+const WAKE_WORD_RE = new RegExp(
+  `\\b(?:hey|hi|okay|ok)\\s+(?:${WAKE_WORD_VARIANTS.join("|")})\\b`,
+  "gi",
+);
 
 /** Avoids duplicate onboarding speech when React Strict Mode mounts twice in development. */
 let onboardingPlaybackSessionStarted = false;
@@ -21,28 +39,26 @@ type ScenePayload = {
 
 type Turn = { role: "user" | "assistant"; text: string };
 
-type SpeechRecognitionLike = {
-  continuous: boolean;
-  interimResults: boolean;
-  lang: string;
-  maxAlternatives?: number;
-  onresult: ((ev: { resultIndex?: number; results: ArrayLike<ArrayLike<{ transcript: string; confidence: number }> & { isFinal: boolean }> }) => void) | null;
-  onspeechstart: (() => void) | null;
-  onerror: ((ev: { error: string }) => void) | null;
-  onend: (() => void) | null;
-  start: () => void;
-  stop: () => void;
-  abort: () => void;
-};
+// Voice activity detection thresholds (tune if mic sensitivity differs).
+const VAD_SPEECH_RMS = 0.03; // start recording above this RMS
+const VAD_SILENCE_MS = 900; // stop recording after this much continuous silence
+const VAD_MIN_UTTERANCE_MS = 350; // drop utterances shorter than this (cough / click)
+const VAD_MAX_UTTERANCE_MS = 9000; // hard cap on a single clip
 
-type SpeechRecognitionCtor = new () => SpeechRecognitionLike;
-
-function getSpeechRecognitionCtor(): SpeechRecognitionCtor | null {
-  const w = window as unknown as {
-    SpeechRecognition?: SpeechRecognitionCtor;
-    webkitSpeechRecognition?: SpeechRecognitionCtor;
-  };
-  return w.SpeechRecognition || w.webkitSpeechRecognition || null;
+function pickRecorderMime(): string {
+  const MR = (window as unknown as { MediaRecorder?: typeof MediaRecorder }).MediaRecorder;
+  if (!MR) return "";
+  const candidates = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/ogg;codecs=opus",
+    "audio/ogg",
+    "audio/mp4",
+  ];
+  for (const t of candidates) {
+    if (MR.isTypeSupported?.(t)) return t;
+  }
+  return "";
 }
 
 function normalizeSpeechText(raw: string): string {
@@ -53,24 +69,39 @@ function normalizeSpeechText(raw: string): string {
     .trim();
 }
 
+function lastWakeMatch(normalized: string): RegExpMatchArray | null {
+  WAKE_WORD_RE.lastIndex = 0;
+  const matches = Array.from(normalized.matchAll(WAKE_WORD_RE));
+  return matches.length ? matches[matches.length - 1] : null;
+}
+
 function transcriptHasWakePhrase(normalized: string): boolean {
-  return normalized.includes(WAKE_PHRASE);
+  return lastWakeMatch(normalized) !== null;
 }
 
 function textAfterWakePhrase(normalized: string): string {
-  const idx = normalized.lastIndexOf(WAKE_PHRASE);
-  if (idx === -1) return "";
-  return normalized.slice(idx + WAKE_PHRASE.length).trim();
+  const m = lastWakeMatch(normalized);
+  if (!m || m.index === undefined) return "";
+  return normalized.slice(m.index + m[0].length).trim();
 }
 
 function parseVoiceIntent(normalizedFull: string): "start" | "stop" | null {
-  if (!transcriptHasWakePhrase(normalizedFull)) return null;
+  const hasWake = transcriptHasWakePhrase(normalizedFull);
   const tail = textAfterWakePhrase(normalizedFull);
   const cmd = tail.length > 0 ? tail : normalizedFull;
-
-  if (/\b(stop|halt)(\s+watching)?\b/.test(cmd)) return "stop";
-  if (/\b(start|begin)(\s+watching)?\b/.test(cmd)) return "start";
-  return null;
+  let intent: "start" | "stop" | null = null;
+  if (hasWake) {
+    if (/\b(stop|halt)(\s+watching)?\b/.test(cmd)) intent = "stop";
+    else if (/\b(start|begin)(\s+watching)?\b/.test(cmd)) intent = "start";
+  }
+  console.debug("[voice] parseVoiceIntent", {
+    normalized: normalizedFull,
+    hasWake,
+    tail,
+    cmd,
+    intent,
+  });
+  return intent;
 }
 
 /** Pause or resume wake listening (not the camera watch session). */
@@ -89,9 +120,6 @@ export function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const stopRef = useRef<HTMLButtonElement>(null);
-  const wakeRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
-  const bargeRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
-
   const statusId = useId();
   const liveId = useId();
   const voiceStatusId = useId();
@@ -104,24 +132,19 @@ export function App() {
   const [lastDescription, setLastDescription] = useState("");
   const [lastHeard, setLastHeard] = useState("");
   const [voiceStatus, setVoiceStatus] = useState<string>("Checking voice support.");
+  const [micGranted, setMicGranted] = useState<boolean | null>(null);
   const [onboardingDone, setOnboardingDone] = useState(
     () => typeof localStorage !== "undefined" && localStorage.getItem(ONBOARDING_STORAGE_KEY) === "1",
   );
-  /** When true, wake recognition is off for privacy; user can resume via UI or voice. */
+  /** When true, the VAD/STT pipeline is off for privacy; user can resume via UI or voice. */
   const [micListeningPaused, setMicListeningPaused] = useState(false);
-  /** Browsers may require a user gesture before SpeechRecognition.start(); then show Enable. */
-  const [wakeNeedsUserGesture, setWakeNeedsUserGesture] = useState(false);
 
   const whisperingRef = useRef(false);
   const inFlightRef = useRef(false);
   const historyRef = useRef<Turn[]>([]);
   const pendingQueryRef = useRef<string | null>(null);
   const graceUntilRef = useRef(0);
-  const wakeListenEnabledRef = useRef(false);
   const micListeningPausedRef = useRef(false);
-  /** Avoids double attach when Resume is clicked (gesture) and the effect runs on the same state. */
-  const skipNextWakeEffectAttachRef = useRef(false);
-  const onWakeTranscriptRef = useRef<(raw: string) => void>(() => {});
 
   useEffect(() => {
     whisperingRef.current = whispering;
@@ -130,6 +153,85 @@ export function App() {
   useEffect(() => {
     micListeningPausedRef.current = micListeningPaused;
   }, [micListeningPaused]);
+
+  const requestMicPermission = useCallback(async (): Promise<boolean> => {
+    console.debug("[voice] mic probe starting", {
+      secureContext: window.isSecureContext,
+      host: window.location.host,
+      protocol: window.location.protocol,
+      userAgent: navigator.userAgent,
+    });
+
+    if (navigator.permissions?.query) {
+      try {
+        const p = await navigator.permissions.query({ name: "microphone" as PermissionName });
+        console.debug("[voice] permissions.microphone =", p.state);
+      } catch (e) {
+        console.debug("[voice] permissions.query threw", e);
+      }
+    }
+
+    if (navigator.mediaDevices?.enumerateDevices) {
+      try {
+        const devs = await navigator.mediaDevices.enumerateDevices();
+        console.debug(
+          "[voice] audio input devices",
+          devs.filter((d) => d.kind === "audioinput").map((d) => ({ id: d.deviceId, label: d.label })),
+        );
+      } catch (e) {
+        console.debug("[voice] enumerateDevices threw", e);
+      }
+    }
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setVoiceStatus("This browser does not expose microphone access.");
+      setMicGranted(false);
+      return false;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream.getTracks().forEach((t) => t.stop());
+      console.debug("[voice] getUserMedia succeeded");
+      setMicGranted(true);
+      setVoiceStatus("Microphone ready. Listening for: hey blindr.");
+      return true;
+    } catch (err) {
+      const name = err instanceof DOMException ? err.name : "UnknownError";
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn("[voice] getUserMedia rejected", { name, message, err });
+      setMicGranted(false);
+      let hint: string;
+      switch (name) {
+        case "NotAllowedError":
+        case "SecurityError":
+          hint =
+            "Microphone blocked by permission. Click the padlock in the address bar, set Microphone to Allow, then press Retry.";
+          break;
+        case "NotFoundError":
+        case "OverconstrainedError":
+          hint = "No microphone was found. Plug one in or select one in the OS, then Retry.";
+          break;
+        case "NotReadableError":
+          hint =
+            "The OS or another app is holding the microphone (e.g. Zoom, Meet, Teams). Close it and press Retry.";
+          break;
+        case "AbortError":
+          hint = "Microphone request was aborted. Press Retry.";
+          break;
+        default:
+          hint = `Microphone error: ${name} — ${message}. Press Retry after fixing.`;
+      }
+      setVoiceStatus(hint);
+      return false;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!onboardingDone) return;
+    if (micGranted !== null) return;
+    void requestMicPermission();
+  }, [onboardingDone, micGranted, requestMicPermission]);
 
   const speakUi = useCallback((text: string, priority: "polite" | "assertive" = "polite") => {
     setVoiceStatus(text);
@@ -301,32 +403,6 @@ export function App() {
     [captureFrameBlob, playBase64Audio, pushTurn],
   );
 
-  const stopWakeRecognitionSafe = useCallback(() => {
-    const rec = wakeRecognitionRef.current;
-    if (!rec) return;
-    try {
-      rec.stop();
-    } catch {
-      /* noop */
-    }
-  }, []);
-
-  const abortWakeRecognition = useCallback(() => {
-    wakeListenEnabledRef.current = false;
-    const rec = wakeRecognitionRef.current;
-    wakeRecognitionRef.current = null;
-    if (!rec) return;
-    try {
-      rec.abort();
-    } catch {
-      try {
-        rec.stop();
-      } catch {
-        /* noop */
-      }
-    }
-  }, []);
-
   const startWhisper = useCallback(() => {
     setWhispering(true);
   }, []);
@@ -347,113 +423,26 @@ export function App() {
   }, [speakUi, stopPlayback]);
 
   const pauseMicListening = useCallback(() => {
-    setWakeNeedsUserGesture(false);
-    abortWakeRecognition();
     setMicListeningPaused(true);
     speakUi(
       "Microphone listening paused. Say hey blindr, resume listening, or use the Resume button.",
     );
-  }, [abortWakeRecognition, speakUi]);
-
-  const attachWakeRecognition = useCallback((): boolean => {
-    const Ctor = getSpeechRecognitionCtor();
-    if (!Ctor) {
-      setWakeNeedsUserGesture(false);
-      setVoiceStatus(
-        "Voice commands need a browser with speech recognition (for example Chrome with HTTPS). Buttons still work.",
-      );
-      return false;
-    }
-
-    abortWakeRecognition();
-
-    const rec = new Ctor();
-    wakeRecognitionRef.current = rec;
-    rec.continuous = true;
-    rec.interimResults = false;
-    rec.lang = "en-US";
-    rec.maxAlternatives = 1;
-    rec.onspeechstart = null;
-
-    rec.onresult = (ev) => {
-      const startIdx = typeof ev.resultIndex === "number" ? ev.resultIndex : 0;
-      let said = "";
-      for (let i = startIdx; i < ev.results.length; i += 1) {
-        const r = ev.results[i];
-        const alt = r[0];
-        if (alt) said += alt.transcript;
-      }
-      if (said.trim()) onWakeTranscriptRef.current(said);
-    };
-
-    rec.onerror = (ev) => {
-      if (ev.error === "not-allowed") {
-        setWakeNeedsUserGesture(false);
-        wakeListenEnabledRef.current = false;
-        setVoiceStatus("Microphone denied. Allow mic for voice commands, or use buttons.");
-      } else if (ev.error === "service-not-allowed") {
-        setWakeNeedsUserGesture(true);
-        speakUi("Tap Enable microphone listening to start the microphone.");
-      } else if (ev.error !== "aborted" && ev.error !== "no-speech") {
-        setVoiceStatus(`Voice recognition issue (${ev.error}).`);
-      }
-    };
-
-    rec.onend = () => {
-      if (
-        wakeListenEnabledRef.current &&
-        !whisperingRef.current &&
-        !micListeningPausedRef.current
-      ) {
-        try {
-          rec.start();
-          setWakeNeedsUserGesture(false);
-        } catch {
-          setWakeNeedsUserGesture(true);
-          speakUi("Tap Enable microphone listening to resume.");
-        }
-      }
-    };
-
-    try {
-      rec.start();
-      wakeListenEnabledRef.current = true;
-      setWakeNeedsUserGesture(false);
-      setVoiceStatus("Microphone listening is on. Say hey blindr, then start or stop.");
-      return true;
-    } catch {
-      wakeListenEnabledRef.current = false;
-      try {
-        rec.abort();
-      } catch {
-        /* noop */
-      }
-      wakeRecognitionRef.current = null;
-      setWakeNeedsUserGesture(true);
-      setVoiceStatus(
-        "Microphone listening needs a tap or key press in this browser. Tap Enable microphone listening.",
-      );
-      speakUi(
-        "Tap Enable microphone listening. Some browsers require a tap or key press before the microphone can start.",
-      );
-      return false;
-    }
-  }, [abortWakeRecognition, speakUi]);
+  }, [speakUi]);
 
   const resumeMicListening = useCallback(() => {
-    skipNextWakeEffectAttachRef.current = true;
     setMicListeningPaused(false);
-    void attachWakeRecognition();
-  }, [attachWakeRecognition]);
+    speakUi("Microphone listening is on. Say hey blindr, then start or stop.");
+  }, [speakUi]);
 
   const resumeMicListeningFromVoice = useCallback(() => {
     speakUi("Resuming microphone listening.");
-    resumeMicListening();
-  }, [resumeMicListening, speakUi]);
+    setMicListeningPaused(false);
+  }, [speakUi]);
 
   const handleVoiceTranscript = useCallback(
     (raw: string) => {
       const normalized = normalizeSpeechText(raw);
+      console.debug("[voice] handleVoiceTranscript", { raw, normalized });
       const listenCtl = parseWakeListeningControl(normalized);
       if (listenCtl === "pause") {
         pauseMicListening();
@@ -483,14 +472,6 @@ export function App() {
     },
     [pauseMicListening, resumeMicListeningFromVoice, speakError, speakUi, startWhisper, stopWhisper],
   );
-
-  useEffect(() => {
-    onWakeTranscriptRef.current = handleVoiceTranscript;
-  }, [handleVoiceTranscript]);
-
-  const enableMicListeningFromGesture = useCallback(() => {
-    void attachWakeRecognition();
-  }, [attachWakeRecognition]);
 
   // Camera + auto-capture loop
   useEffect(() => {
@@ -539,127 +520,195 @@ export function App() {
     };
   }, [whispering, intervalSec, sendFrame]);
 
-  // Wake phrase + start/stop when not watching (mic on by default after onboarding)
+  // Continuous capture: VAD-driven MediaRecorder → POST /api/stt → transcript pipeline.
+  // Handles both pre-watch wake-phrase detection and in-watch barge-in/questions.
   useEffect(() => {
-    if (!onboardingDone || whispering || micListeningPaused) {
-      setWakeNeedsUserGesture(false);
-      abortWakeRecognition();
+    if (!onboardingDone || micGranted !== true) return;
+    if (micListeningPaused) {
+      setVoiceStatus(
+        "Microphone listening paused. Say nothing is heard. Press Resume to re-enable.",
+      );
       return;
     }
 
-    if (skipNextWakeEffectAttachRef.current) {
-      skipNextWakeEffectAttachRef.current = false;
-      return;
-    }
+    const mime = pickRecorderMime();
+    let stream: MediaStream | null = null;
+    let audioCtx: AudioContext | null = null;
+    let analyser: AnalyserNode | null = null;
+    let recorder: MediaRecorder | null = null;
+    let chunks: Blob[] = [];
+    let rafId = 0;
+    let silenceStart: number | null = null;
+    let recordStart = 0;
+    let cancelled = false;
 
-    void attachWakeRecognition();
-
-    return () => {
-      abortWakeRecognition();
-    };
-  }, [
-    onboardingDone,
-    whispering,
-    micListeningPaused,
-    abortWakeRecognition,
-    attachWakeRecognition,
-  ]);
-
-  // Barge-in: speech recognition while watching (questions + hey blindr stop)
-  useEffect(() => {
-    if (!whispering || micListeningPaused) return;
-
-    stopWakeRecognitionSafe();
-
-    const Ctor = getSpeechRecognitionCtor();
-    if (!Ctor) {
-      setStatusMessage("Voice interrupt unsupported in this browser.");
-      return;
-    }
-
-    const rec = new Ctor();
-    bargeRecognitionRef.current = rec;
-    rec.continuous = true;
-    rec.interimResults = true;
-    rec.lang = navigator.language || "en-US";
-
-    let restartTimer: number | undefined;
-    let stopped = false;
-
-    rec.onspeechstart = () => {
-      if (!whisperingRef.current) return;
-      stopPlayback();
-      graceUntilRef.current = Date.now() + GRACE_MS;
-      setStatusMessage("Listening to you.");
-    };
-
-    rec.onresult = (ev) => {
-      if (!whisperingRef.current) return;
-      let finalText = "";
-      let interim = "";
-      for (let i = 0; i < ev.results.length; i += 1) {
-        const r = ev.results[i];
-        const alt = r[0];
-        if (!alt) continue;
-        if (r.isFinal) finalText += alt.transcript;
-        else interim += alt.transcript;
+    const stopRecordingSoon = () => {
+      if (recorder && recorder.state !== "inactive") {
+        try {
+          recorder.stop();
+        } catch (e) {
+          console.debug("[voice:vad] recorder.stop threw", e);
+        }
       }
-      if (interim && !finalText) {
+    };
+
+    const startRecording = () => {
+      if (!stream || recorder) return;
+      try {
+        recorder = mime
+          ? new MediaRecorder(stream, { mimeType: mime })
+          : new MediaRecorder(stream);
+      } catch (e) {
+        console.warn("[voice:vad] MediaRecorder ctor failed", e);
+        return;
+      }
+      chunks = [];
+      recorder.ondataavailable = (ev: BlobEvent) => {
+        if (ev.data && ev.data.size) chunks.push(ev.data);
+      };
+      recorder.onstop = () => {
+        const blob = new Blob(chunks, { type: mime || "audio/webm" });
+        const durMs = performance.now() - recordStart;
+        chunks = [];
+        recorder = null;
+        silenceStart = null;
+        console.debug("[voice:vad] recorder stopped", {
+          durMs: Math.round(durMs),
+          bytes: blob.size,
+        });
+        if (cancelled) return;
+        if (durMs < VAD_MIN_UTTERANCE_MS || blob.size < 1024) return;
+        void uploadClip(blob);
+      };
+      recorder.start();
+      recordStart = performance.now();
+      console.debug("[voice:vad] recording started", { mime });
+      if (whisperingRef.current) {
         stopPlayback();
         graceUntilRef.current = Date.now() + GRACE_MS;
-      }
-      if (finalText) {
-        const cleaned = finalText.trim();
-        if (!cleaned) return;
-        setLastHeard(cleaned);
-        const normalized = normalizeSpeechText(cleaned);
-        if (parseVoiceIntent(normalized) === "stop") {
-          stopWhisper();
-          return;
-        }
-        pendingQueryRef.current = cleaned;
-        graceUntilRef.current = Date.now() + GRACE_MS;
-        void sendFrame({ force: true });
+        setStatusMessage("Listening to you.");
       }
     };
 
-    rec.onerror = (ev) => {
-      if (ev.error === "no-speech" || ev.error === "aborted") return;
-      setStatusMessage(`Speech recognition error: ${ev.error}`);
-    };
-
-    rec.onend = () => {
-      if (stopped || !whisperingRef.current) return;
-      restartTimer = window.setTimeout(() => {
-        try {
-          rec.start();
-        } catch {
-          /* already started or mic denied */
+    const uploadClip = async (blob: Blob) => {
+      const ext = (mime || "audio/webm").split("/")[1]?.split(";")[0] || "webm";
+      const fd = new FormData();
+      fd.append("audio", blob, `clip.${ext}`);
+      try {
+        const res = await fetch(`${apiBase}/api/stt`, { method: "POST", body: fd });
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(text || `STT failed (${res.status})`);
         }
-      }, 200);
+        const data = (await res.json()) as { text: string };
+        const text = (data.text || "").trim();
+        console.debug("[voice:stt] transcript", { text, bytes: blob.size });
+        if (!text) return;
+        setLastHeard(text);
+        if (whisperingRef.current) {
+          const normalized = normalizeSpeechText(text);
+          const intent = parseVoiceIntent(normalized);
+          if (intent === "stop") {
+            stopWhisper();
+            return;
+          }
+          pendingQueryRef.current = text;
+          graceUntilRef.current = Date.now() + GRACE_MS;
+          void sendFrame({ force: true });
+        } else {
+          handleVoiceTranscript(text);
+        }
+      } catch (e) {
+        console.warn("[voice:stt] upload failed", e);
+      }
     };
 
-    try {
-      rec.start();
-    } catch {
-      setStatusMessage("Microphone denied or unavailable.");
-    }
+    const tick = () => {
+      if (cancelled || !analyser) return;
+      const bufLen = analyser.fftSize;
+      const data = new Float32Array(bufLen);
+      analyser.getFloatTimeDomainData(data);
+      let sum = 0;
+      for (let i = 0; i < bufLen; i += 1) sum += data[i] * data[i];
+      const rms = Math.sqrt(sum / bufLen);
+      const now = performance.now();
+
+      if (rms > VAD_SPEECH_RMS) {
+        silenceStart = null;
+        if (!recorder) startRecording();
+      } else if (recorder) {
+        if (silenceStart === null) silenceStart = now;
+        const silent = now - silenceStart;
+        const recording = now - recordStart;
+        if (silent >= VAD_SILENCE_MS || recording >= VAD_MAX_UTTERANCE_MS) {
+          stopRecordingSoon();
+        }
+      }
+
+      rafId = requestAnimationFrame(tick);
+    };
+
+    (async () => {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch (e) {
+        console.warn("[voice:vad] getUserMedia failed", e);
+        setVoiceStatus("Could not open microphone for voice input.");
+        return;
+      }
+      if (cancelled) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+      const Ctx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!Ctx) {
+        setVoiceStatus("AudioContext unsupported in this browser.");
+        return;
+      }
+      audioCtx = new Ctx();
+      const src = audioCtx.createMediaStreamSource(stream);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 1024;
+      src.connect(analyser);
+      setVoiceStatus(
+        whisperingRef.current
+          ? "Watching. Speak to ask, or say hey blindr, stop."
+          : "Listening for: hey blindr, then start or stop.",
+      );
+      rafId = requestAnimationFrame(tick);
+    })();
 
     return () => {
-      stopped = true;
-      if (restartTimer) window.clearTimeout(restartTimer);
-      rec.onresult = null;
-      rec.onspeechstart = null;
-      rec.onerror = null;
-      rec.onend = null;
-      try {
-        rec.abort();
-      } catch {
-        /* noop */
+      cancelled = true;
+      if (rafId) cancelAnimationFrame(rafId);
+      if (recorder && recorder.state !== "inactive") {
+        try {
+          recorder.stop();
+        } catch {
+          /* noop */
+        }
       }
-      bargeRecognitionRef.current = null;
+      recorder = null;
+      if (audioCtx) {
+        try {
+          void audioCtx.close();
+        } catch {
+          /* noop */
+        }
+      }
+      stream?.getTracks().forEach((t) => t.stop());
     };
-  }, [micListeningPaused, whispering, sendFrame, stopPlayback, stopWakeRecognitionSafe, stopWhisper]);
+  }, [
+    handleVoiceTranscript,
+    micGranted,
+    micListeningPaused,
+    onboardingDone,
+    sendFrame,
+    stopPlayback,
+    stopWhisper,
+  ]);
 
   const replayOnboarding = useCallback(() => {
     if (typeof speechSynthesis !== "undefined") speechSynthesis.cancel();
@@ -703,21 +752,11 @@ export function App() {
               {voiceStatus}
             </p>
             <p className="help-text">
-              Web Speech API is used for commands and questions. Requires a secure context (HTTPS or
-              localhost). Some browsers only start the microphone after you tap or press a key; use
-              Enable microphone listening if it appears. Speech recognition may send audio to your
-              browser vendor; see your browser documentation.
+              Voice commands and questions are transcribed by ElevenLabs speech-to-text via your
+              backend. Audio is captured locally and uploaded after each utterance.
             </p>
             <div className="controls">
-              {wakeNeedsUserGesture ? (
-                <button
-                  type="button"
-                  className="btn-primary"
-                  onClick={enableMicListeningFromGesture}
-                >
-                  Enable microphone listening
-                </button>
-              ) : !micListeningPaused ? (
+              {!micListeningPaused ? (
                 <button type="button" className="btn-ghost" onClick={pauseMicListening}>
                   Pause microphone listening
                 </button>
@@ -729,6 +768,15 @@ export function App() {
               <button type="button" className="btn-ghost" onClick={replayOnboarding}>
                 Replay spoken onboarding
               </button>
+              {micGranted !== true ? (
+                <button
+                  type="button"
+                  className="btn-primary"
+                  onClick={() => void requestMicPermission()}
+                >
+                  {micGranted === false ? "Retry microphone" : "Grant microphone"}
+                </button>
+              ) : null}
             </div>
           </section>
 

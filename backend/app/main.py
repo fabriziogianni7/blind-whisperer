@@ -55,6 +55,11 @@ class SceneResponse(BaseModel):
     speak: bool = True
 
 
+class TranscriptResponse(BaseModel):
+    text: str
+    language_code: str | None = None
+
+
 def get_settings() -> Settings:
     return settings
 
@@ -150,6 +155,53 @@ async def _synthesize_speech(s: Settings, text: str) -> bytes:
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.post("/api/stt", response_model=TranscriptResponse)
+async def speech_to_text(
+    audio: Annotated[UploadFile, File(description="Audio clip (webm/ogg/mp3/wav)")],
+    s: Annotated[Settings, Depends(get_settings)],
+):
+    if not s.elevenlabs_api_key:
+        raise HTTPException(status_code=500, detail="ELEVENLABS_API_KEY is not configured")
+
+    raw = await audio.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty audio upload")
+    if len(raw) < 1024:
+        # Too short to transcribe usefully; skip the API call.
+        return TranscriptResponse(text="", language_code=None)
+
+    mime = audio.content_type or "audio/webm"
+    filename = audio.filename or f"clip.{mime.split('/')[-1].split(';')[0] or 'webm'}"
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as http:
+            resp = await http.post(
+                "https://api.elevenlabs.io/v1/speech-to-text",
+                headers={"xi-api-key": s.elevenlabs_api_key},
+                data={"model_id": s.elevenlabs_stt_model},
+                files={"file": (filename, raw, mime)},
+            )
+    except httpx.HTTPError as exc:
+        logger.exception("ElevenLabs STT request failed")
+        raise HTTPException(status_code=502, detail=f"ElevenLabs STT network error: {exc}") from exc
+
+    if resp.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"ElevenLabs STT error {resp.status_code}: {resp.text[:500]}",
+        )
+
+    try:
+        payload = resp.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail=f"ElevenLabs STT non-JSON response: {exc}") from exc
+
+    return TranscriptResponse(
+        text=(payload.get("text") or "").strip(),
+        language_code=payload.get("language_code"),
+    )
 
 
 @app.post("/api/scene", response_model=SceneResponse)
